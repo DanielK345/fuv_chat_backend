@@ -1,6 +1,5 @@
 import socketio
 from flask import Flask
-import eventlet
 import logging
 import os
 import threading
@@ -723,9 +722,47 @@ class ChatServer:
                         del self.active_file_transfers[transfer_id]
 
 
+# Create server instance at module level for gunicorn
+_chat_server_instance = None
+
+def get_app():
+    """Get or create server instance (for gunicorn)."""
+    global _chat_server_instance
+    if _chat_server_instance is None:
+        _chat_server_instance = ChatServer()
+    return _chat_server_instance.app
+
 if __name__ == "__main__":
     server = ChatServer()
-    HOST = os.environ.get("CHAT_HOST", "localhost")
-    PORT = int(os.environ.get("CHAT_PORT", 5000))
+    # Render provides PORT env var; use CHAT_PORT or default 5000 otherwise
+    PORT = int(os.environ.get("PORT") or os.environ.get("CHAT_PORT", 5000))
+    # Always bind to 0.0.0.0 for cloud deployments (Render, AWS, etc.)
+    HOST = os.environ.get("CHAT_HOST", "0.0.0.0")
     logging.info(f"Starting server on {HOST}:{PORT}")
-    eventlet.wsgi.server(eventlet.listen((HOST, PORT)), server.app)
+    
+    # Use gunicorn with gevent worker for Python 3.12+ compatibility
+    try:
+        from gunicorn.app.wsgiapp import WSGIApplication
+        
+        class StandaloneApplication(WSGIApplication):
+            def init(self, parser, opts, args):
+                self.cfg.set("bind", f"{HOST}:{PORT}")
+                self.cfg.set("worker_class", "gevent")
+                self.cfg.set("workers", 1)
+                self.cfg.set("worker_connections", 1000)
+                self.cfg.set("log_level", "info")
+            
+            def load(self):
+                return server.app
+        
+        StandaloneApplication().run()
+    except ImportError:
+        # Fallback: use gevent WSGI server directly
+        try:
+            from gevent import pywsgi
+            logging.info("Using gevent WSGI server")
+            http_server = pywsgi.WSGIServer((HOST, PORT), server.app)
+            http_server.serve_forever()
+        except ImportError:
+            logging.error("Neither gunicorn nor gevent available. Please install: pip install gunicorn gevent")
+            raise
